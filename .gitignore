@@ -43,3 +43,8 @@ next-env.d.ts
 /src/generated/prisma
 
 .vercel
+
+# Claude Code / agent tooling
+CLAUDE.md
+AGENTS.md
+.claude/
