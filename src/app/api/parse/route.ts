@@ -43,8 +43,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(parsed);
   } catch (err) {
     console.error("[/api/parse] error", err);
+    const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { error: "Failed to parse receipt" },
+      {
+        error: "Failed to parse receipt",
+        detail: detail.slice(0, 400),
+      },
       { status: 500 },
     );
   }

@@ -21,7 +21,8 @@ export default function ReceiptUpload() {
       const parseRes = await fetch("/api/parse", { method: "POST", body: fd });
       if (!parseRes.ok) {
         const err = await parseRes.json().catch(() => ({}));
-        throw new Error(err.error ?? "Failed to parse receipt");
+        const baseMsg = err.error ?? "Failed to parse receipt";
+        throw new Error(err.detail ? `${baseMsg}: ${err.detail}` : baseMsg);
       }
       const parsed: ParsedReceipt = await parseRes.json();
 
