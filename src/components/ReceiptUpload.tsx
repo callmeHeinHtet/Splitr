@@ -7,7 +7,8 @@ import type { ParsedReceipt } from "@/types/receipt";
 
 export default function ReceiptUpload() {
   const router = useRouter();
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<"idle" | "parsing" | "creating">("idle");
 
@@ -43,10 +44,18 @@ export default function ReceiptUpload() {
     }
   }
 
+  const buttonLabel =
+    stage === "parsing"
+      ? "Reading receipt…"
+      : stage === "creating"
+        ? "Setting up your bill…"
+        : null;
+
   return (
     <div className="w-full max-w-md mx-auto">
+      {/* Hidden inputs */}
       <input
-        ref={fileInputRef}
+        ref={cameraInputRef}
         type="file"
         accept="image/*"
         capture="environment"
@@ -56,18 +65,86 @@ export default function ReceiptUpload() {
           if (file) handleFile(file);
         }}
       />
-      <button
-        onClick={() => fileInputRef.current?.click()}
-        disabled={busy}
-        className="w-full py-6 px-8 rounded-2xl bg-black text-white text-lg font-medium shadow-lg hover:bg-zinc-800 active:scale-[0.98] transition disabled:opacity-60 disabled:cursor-not-allowed"
-      >
-        {stage === "idle" && "Snap a receipt"}
-        {stage === "parsing" && "Reading receipt…"}
-        {stage === "creating" && "Setting up your bill…"}
-      </button>
-      <p className="text-center text-sm text-zinc-500 mt-3">
-        Photo from camera or gallery. JPEG/PNG, under 10MB.
+      <input
+        ref={uploadInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) handleFile(file);
+        }}
+      />
+
+      {buttonLabel ? (
+        <button
+          disabled
+          className="w-full py-6 px-8 rounded-2xl bg-black text-white text-lg font-medium shadow-lg disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          {buttonLabel}
+        </button>
+      ) : (
+        <div className="space-y-3">
+          <button
+            onClick={() => cameraInputRef.current?.click()}
+            disabled={busy}
+            className="w-full py-6 px-8 rounded-2xl bg-black text-white text-lg font-medium shadow-lg hover:bg-zinc-800 active:scale-[0.98] transition disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-3"
+          >
+            <CameraIcon />
+            <span>Snap a receipt</span>
+          </button>
+          <button
+            onClick={() => uploadInputRef.current?.click()}
+            disabled={busy}
+            className="w-full py-4 px-8 rounded-2xl bg-white border border-zinc-200 text-zinc-900 text-base font-medium hover:border-zinc-400 active:scale-[0.98] transition disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-3"
+          >
+            <UploadIcon />
+            <span>Upload from gallery</span>
+          </button>
+        </div>
+      )}
+      <p className="text-center text-sm text-zinc-500 mt-4">
+        JPEG / PNG, under 10MB.
       </p>
     </div>
+  );
+}
+
+function CameraIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
+      <circle cx="12" cy="13" r="4" />
+    </svg>
+  );
+}
+
+function UploadIcon() {
+  return (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="17 8 12 3 7 8" />
+      <line x1="12" y1="3" x2="12" y2="15" />
+    </svg>
   );
 }
