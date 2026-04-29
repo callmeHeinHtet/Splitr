@@ -1,0 +1,60 @@
+// Splitr schema
+// https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Bill {
+  id           String        @id @default(cuid())
+  restaurant   String?
+  currency     String        @default("USD")
+  subtotal     Float
+  tax          Float         @default(0)
+  tip          Float         @default(0)
+  total        Float
+  imageUrl     String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  items        BillItem[]
+  participants Participant[]
+}
+
+model BillItem {
+  id          String           @id @default(cuid())
+  billId      String
+  name        String
+  price       Float
+  quantity    Int              @default(1)
+  bill        Bill             @relation(fields: [billId], references: [id], onDelete: Cascade)
+  assignments ItemAssignment[]
+
+  @@index([billId])
+}
+
+model Participant {
+  id          String           @id @default(cuid())
+  billId      String
+  name        String
+  payHandle   String?
+  payProvider String?
+  bill        Bill             @relation(fields: [billId], references: [id], onDelete: Cascade)
+  assignments ItemAssignment[]
+
+  @@index([billId])
+}
+
+model ItemAssignment {
+  itemId        String
+  participantId String
+  item          BillItem    @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  @@id([itemId, participantId])
+  @@index([participantId])
+}
