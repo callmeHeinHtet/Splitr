@@ -11,18 +11,21 @@ datasource db {
 }
 
 model Bill {
-  id           String        @id @default(cuid())
-  restaurant   String?
-  currency     String        @default("USD")
-  subtotal     Float
-  tax          Float         @default(0)
-  tip          Float         @default(0)
-  total        Float
-  imageUrl     String?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  items        BillItem[]
-  participants Participant[]
+  id            String        @id @default(cuid())
+  restaurant    String?
+  currency      String        @default("USD")
+  subtotal      Float
+  tax           Float         @default(0)
+  tip           Float         @default(0)
+  total         Float
+  imageUrl      String?
+  payerHandle   String?
+  payerProvider String?
+  payerName     String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  items         BillItem[]
+  participants  Participant[]
 }
 
 model BillItem {
@@ -43,6 +46,8 @@ model Participant {
   name        String
   payHandle   String?
   payProvider String?
+  paid        Boolean          @default(false)
+  paidAt      DateTime?
   bill        Bill             @relation(fields: [billId], references: [id], onDelete: Cascade)
   assignments ItemAssignment[]
 

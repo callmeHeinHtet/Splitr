@@ -5,6 +5,7 @@ export type ParticipantSplit = {
   participantName: string;
   payHandle: string | null;
   payProvider: string | null;
+  paid: boolean;
   items: { name: string; share: number; pricePerUnit: number; quantity: number }[];
   itemsTotal: number;
   taxShare: number;
@@ -32,6 +33,7 @@ export function computeSplit(bill: FullBill): SplitResult {
     participantName: p.name,
     payHandle: p.payHandle,
     payProvider: p.payProvider,
+    paid: p.paid,
     items: [] as ParticipantSplit["items"],
     itemsTotal: 0,
     taxShare: 0,

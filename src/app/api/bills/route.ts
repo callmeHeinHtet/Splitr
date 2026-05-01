@@ -43,8 +43,9 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+    const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { error: "Failed to create bill" },
+      { error: "Failed to create bill", detail: detail.slice(0, 400) },
       { status: 500 },
     );
   }

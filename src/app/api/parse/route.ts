@@ -1,10 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseReceipt } from "@/lib/ai";
+import { rateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
 export async function POST(req: NextRequest) {
+  // 10 receipts per minute per IP. Stops accidental hammering and keeps
+  // the Gemini quota safe if the URL is shared publicly.
+  const limit = rateLimit(req, {
+    name: "parse",
+    max: 10,
+    windowMs: 60_000,
+  });
+  if (!limit.allowed) {
+    const retryAfter = Math.max(
+      1,
+      Math.ceil((limit.resetAt - Date.now()) / 1000),
+    );
+    return NextResponse.json(
+      {
+        error: "Too many requests",
+        detail: `Try again in ${retryAfter}s.`,
+      },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(retryAfter),
+          "X-RateLimit-Remaining": "0",
+        },
+      },
+    );
+  }
+
   try {
     const formData = await req.formData();
     const file = formData.get("image");

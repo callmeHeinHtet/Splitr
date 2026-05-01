@@ -2,12 +2,42 @@ import { generateObject } from "ai";
 import { google } from "@ai-sdk/google";
 import { parsedReceiptSchema, type ParsedReceipt } from "@/types/receipt";
 
+const MODEL_CHAIN = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash-lite",
+] as const;
+
+function isOverloadedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /overload|high demand|rate.?limit|429|503|unavailable|quota/i.test(msg);
+}
+
 export async function parseReceipt(
   imageBuffer: Buffer,
   mimeType: string,
 ): Promise<ParsedReceipt> {
+  let lastErr: unknown;
+  for (const modelId of MODEL_CHAIN) {
+    try {
+      return await callModel(modelId, imageBuffer, mimeType);
+    } catch (err) {
+      lastErr = err;
+      if (!isOverloadedError(err)) throw err;
+      console.warn(`[parseReceipt] ${modelId} overloaded, trying next model`);
+    }
+  }
+  throw lastErr;
+}
+
+async function callModel(
+  modelId: string,
+  imageBuffer: Buffer,
+  mimeType: string,
+): Promise<ParsedReceipt> {
   const { object } = await generateObject({
-    model: google("gemini-2.5-flash"),
+    model: google(modelId),
     schema: parsedReceiptSchema,
     messages: [
       {
@@ -61,3 +91,4 @@ If the image isn't a receipt or is unreadable, return empty items array and 0 fo
 
   return object;
 }
+

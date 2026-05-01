@@ -3,57 +3,161 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import toast from "react-hot-toast";
+import { useRouter } from "next/navigation";
 import type { FullBill } from "@/types/bill";
 import { computeSplit } from "@/lib/split";
+import { formatMoney } from "@/lib/money";
+import { isBillOwner } from "@/lib/ownership";
+import DeleteBillButton from "@/components/DeleteBillButton";
 
 type Props = { initialBill: FullBill };
 
+type IdMap = {
+  participants: Record<string, string>;
+  items: Record<string, string>;
+};
+
+/** Recompute subtotal/total locally so the UI reflects edits instantly. */
+function withRecomputedTotals(b: FullBill): FullBill {
+  const subtotal = b.items.reduce(
+    (s, it) => s + (it.price || 0) * (it.quantity || 1),
+    0,
+  );
+  const total = subtotal + (b.tax || 0) + (b.tip || 0);
+  return { ...b, subtotal, total };
+}
+
+/** Apply server's tmp→real id translations to local state without losing edits. */
+function applyIdMap(current: FullBill, idMap: IdMap): FullBill {
+  const pMap = idMap?.participants ?? {};
+  const iMap = idMap?.items ?? {};
+  if (Object.keys(pMap).length === 0 && Object.keys(iMap).length === 0) {
+    return current;
+  }
+  return {
+    ...current,
+    participants: current.participants.map((p) =>
+      pMap[p.id] && pMap[p.id] !== p.id ? { ...p, id: pMap[p.id] } : p,
+    ),
+    items: current.items.map((it) => {
+      const newId = iMap[it.id] ?? it.id;
+      return {
+        ...it,
+        id: newId,
+        billId: current.id,
+        assignments: it.assignments.map((a) => ({
+          itemId: iMap[a.itemId] ?? a.itemId ?? newId,
+          participantId: pMap[a.participantId] ?? a.participantId,
+        })),
+      };
+    }),
+  };
+}
+
 export default function BillEditor({ initialBill }: Props) {
-  const [bill, setBill] = useState<FullBill>(initialBill);
+  const router = useRouter();
+  // Initial bill comes from the server with whatever the parser stored —
+  // recompute totals once so the displayed Total always equals subtotal+tax+tip.
+  const [bill, setBillRaw] = useState<FullBill>(() =>
+    withRecomputedTotals(initialBill),
+  );
   const [selectedParticipantId, setSelectedParticipantId] = useState<
     string | null
   >(null);
   const [saving, setSaving] = useState(false);
+
+  // Friends viewing a shared link shouldn't land on the editor — bounce them
+  // to the read-only summary instead.
+  useEffect(() => {
+    if (!isBillOwner(initialBill.id)) {
+      router.replace(`/b/${initialBill.id}/summary`);
+    }
+  }, [initialBill.id, router]);
+
+  const billRef = useRef(bill);
+  useEffect(() => {
+    billRef.current = bill;
+  }, [bill]);
+
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inFlight = useRef<Promise<void> | null>(null);
+  const pendingDirty = useRef(false);
+
+  // Wrapper that always recomputes subtotal/total locally
+  const setBill = (
+    update: FullBill | ((prev: FullBill) => FullBill),
+  ) => {
+    setBillRaw((prev) => {
+      const nextRaw =
+        typeof update === "function"
+          ? (update as (p: FullBill) => FullBill)(prev)
+          : update;
+      return withRecomputedTotals(nextRaw);
+    });
+  };
 
   const split = useMemo(() => computeSplit(bill), [bill]);
 
-  // Debounced save
-  function scheduleSave(next: FullBill) {
+  function scheduleSave() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => save(next), 350);
+    saveTimer.current = setTimeout(() => triggerSave(), 350);
   }
 
-  async function save(next: FullBill) {
+  function triggerSave() {
+    if (inFlight.current) {
+      pendingDirty.current = true;
+      return;
+    }
+    pendingDirty.current = false;
+    inFlight.current = save().finally(() => {
+      inFlight.current = null;
+      if (pendingDirty.current) {
+        pendingDirty.current = false;
+        triggerSave();
+      }
+    });
+  }
+
+  async function save() {
     setSaving(true);
     try {
+      const snapshot = billRef.current;
       const payload = {
-        restaurant: next.restaurant,
-        tax: next.tax,
-        tip: next.tip,
-        items: next.items.map((it) => ({
-          id: it.id.startsWith("tmp_") ? undefined : it.id,
+        restaurant: snapshot.restaurant,
+        tax: snapshot.tax,
+        tip: snapshot.tip,
+        items: snapshot.items.map((it) => ({
+          id: it.id,
           name: it.name,
           price: it.price,
           quantity: it.quantity,
           assigneeIds: it.assignments.map((a) => a.participantId),
         })),
-        participants: next.participants.map((p) => ({
-          id: p.id.startsWith("tmp_") ? undefined : p.id,
+        participants: snapshot.participants.map((p) => ({
+          id: p.id,
           name: p.name,
           payHandle: p.payHandle,
           payProvider: p.payProvider,
         })),
       };
-      const res = await fetch(`/api/bills/${next.id}`, {
+      const res = await fetch(`/api/bills/${snapshot.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) throw new Error("Save failed");
-      const fresh: FullBill = await res.json();
-      setBill(fresh);
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.detail ?? errBody.error ?? "Save failed");
+      }
+      const data = await res.json();
+      const idMap: IdMap = data.idMap ?? { participants: {}, items: {} };
+
+      setBill((current) => applyIdMap(current, idMap));
+      setSelectedParticipantId((prev) =>
+        prev && idMap.participants[prev] ? idMap.participants[prev] : prev,
+      );
     } catch (err) {
+      console.error("[save] failed", err);
       toast.error(err instanceof Error ? err.message : "Save failed");
     } finally {
       setSaving(false);
@@ -66,209 +170,273 @@ export default function BillEditor({ initialBill }: Props) {
     };
   }, []);
 
-  // ---------- Item handlers ----------
-  function patchItem(itemId: string, patch: Partial<{ name: string; price: number; quantity: number }>) {
-    const next = {
-      ...bill,
-      items: bill.items.map((it) => (it.id === itemId ? { ...it, ...patch } : it)),
-    };
-    setBill(next);
-    scheduleSave(next);
+  function patchItem(
+    itemId: string,
+    patch: Partial<{ name: string; price: number; quantity: number }>,
+  ) {
+    setBill((b) => ({
+      ...b,
+      items: b.items.map((it) =>
+        it.id === itemId ? { ...it, ...patch } : it,
+      ),
+    }));
+    scheduleSave();
   }
 
   function deleteItem(itemId: string) {
-    const next = {
-      ...bill,
-      items: bill.items.filter((it) => it.id !== itemId),
-    };
-    setBill(next);
-    scheduleSave(next);
+    setBill((b) => ({
+      ...b,
+      items: b.items.filter((it) => it.id !== itemId),
+    }));
+    scheduleSave();
   }
 
   function addItem() {
     const tmpId = `tmp_item_${Math.random().toString(36).slice(2)}`;
-    const next = {
-      ...bill,
+    setBill((b) => ({
+      ...b,
       items: [
-        ...bill.items,
+        ...b.items,
         {
           id: tmpId,
-          billId: bill.id,
+          billId: b.id,
           name: "New item",
           price: 0,
           quantity: 1,
           assignments: [],
         },
       ],
-    };
-    setBill(next);
-    scheduleSave(next);
+    }));
+    scheduleSave();
   }
 
-  // ---------- Participant handlers ----------
   function addParticipant(name: string) {
     if (!name.trim()) return;
     const tmpId = `tmp_p_${Math.random().toString(36).slice(2)}`;
-    const next = {
-      ...bill,
+    setBill((b) => ({
+      ...b,
       participants: [
-        ...bill.participants,
+        ...b.participants,
         {
           id: tmpId,
-          billId: bill.id,
+          billId: b.id,
           name: name.trim(),
           payHandle: null,
           payProvider: null,
+          paid: false,
+          paidAt: null,
           assignments: [],
         },
       ],
-    };
-    setBill(next);
-    scheduleSave(next);
+    }));
+    scheduleSave();
   }
 
   function removeParticipant(pId: string) {
-    const next = {
-      ...bill,
-      participants: bill.participants.filter((p) => p.id !== pId),
-      items: bill.items.map((it) => ({
+    setBill((b) => ({
+      ...b,
+      participants: b.participants.filter((p) => p.id !== pId),
+      items: b.items.map((it) => ({
         ...it,
         assignments: it.assignments.filter((a) => a.participantId !== pId),
       })),
-    };
-    setBill(next);
+    }));
     if (selectedParticipantId === pId) setSelectedParticipantId(null);
-    scheduleSave(next);
+    scheduleSave();
   }
 
-  // ---------- Assignment handlers ----------
   function toggleAssignment(itemId: string, participantId: string) {
-    const item = bill.items.find((it) => it.id === itemId);
-    if (!item) return;
-    const isAssigned = item.assignments.some(
-      (a) => a.participantId === participantId,
-    );
-    const next = {
-      ...bill,
-      items: bill.items.map((it) =>
-        it.id !== itemId
-          ? it
-          : {
-              ...it,
-              assignments: isAssigned
-                ? it.assignments.filter((a) => a.participantId !== participantId)
-                : [...it.assignments, { itemId, participantId }],
-            },
-      ),
-    };
-    setBill(next);
-    scheduleSave(next);
+    setBill((b) => {
+      const item = b.items.find((it) => it.id === itemId);
+      if (!item) return b;
+      const isAssigned = item.assignments.some(
+        (a) => a.participantId === participantId,
+      );
+      return {
+        ...b,
+        items: b.items.map((it) =>
+          it.id !== itemId
+            ? it
+            : {
+                ...it,
+                assignments: isAssigned
+                  ? it.assignments.filter(
+                      (a) => a.participantId !== participantId,
+                    )
+                  : [
+                      ...it.assignments,
+                      { itemId: it.id, participantId },
+                    ],
+              },
+        ),
+      };
+    });
+    scheduleSave();
   }
 
   function patchTaxOrTip(field: "tax" | "tip", value: number) {
-    const next = { ...bill, [field]: value };
-    setBill(next);
-    scheduleSave(next);
+    setBill((b) => ({ ...b, [field]: value }));
+    scheduleSave();
   }
 
-  const allItemsAssigned = bill.items.every((it) => it.assignments.length > 0);
+  const allItemsAssigned =
+    bill.items.length > 0 &&
+    bill.items.every((it) => it.assignments.length > 0);
   const noParticipants = bill.participants.length === 0;
+  const unassignedCount = bill.items.filter(
+    (it) => it.assignments.length === 0,
+  ).length;
 
   return (
-    <main className="min-h-screen pb-[max(8rem,calc(env(safe-area-inset-bottom)+8rem))]">
+    <main className="min-h-screen pb-[max(2rem,env(safe-area-inset-bottom))] bg-bg">
       {/* Header */}
-      <header className="sticky top-0 z-10 backdrop-blur bg-zinc-50/80 border-b border-zinc-200 pt-[env(safe-area-inset-top)]">
-        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
-          <Link href="/" className="text-zinc-500 text-sm hover:text-zinc-900">
-            ← New bill
+      <header className="sticky top-0 z-20 backdrop-blur-md bg-bg/85 border-b border-edge pt-[env(safe-area-inset-top)]">
+        <div className="max-w-md mx-auto px-5 py-3 flex items-center justify-between gap-3">
+          <Link
+            href="/"
+            className="font-mono text-[10px] uppercase tracking-[0.22em] text-fg-dim hover:text-fg transition"
+          >
+            ← New
           </Link>
-          <div className="flex-1 mx-3 truncate text-center font-medium text-zinc-700">
+          <span className="font-display italic text-base text-fg truncate">
             {bill.restaurant ?? "Untitled bill"}
-          </div>
-          <span className="text-xs text-zinc-400 w-12 text-right">
-            {saving ? "Saving…" : "Saved"}
+          </span>
+          <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.22em] text-fg-faint">
+            <span
+              className={`w-1.5 h-1.5 rounded-full transition-colors ${saving ? "bg-warn anim-pulse-soft" : "bg-fg-faint/50"}`}
+            />
+            {saving ? "Saving" : "Saved"}
           </span>
         </div>
       </header>
 
-      <div className="max-w-2xl mx-auto px-4 py-6 space-y-8">
-        {/* Items */}
-        <section>
-          <SectionHeader title="Items" />
-          <ul className="space-y-2">
+      <div className="max-w-md mx-auto px-5 pt-6">
+        {/* Receipt-card */}
+        <article className="paper border border-edge rounded-3xl px-5 sm:px-7 py-7 shadow-[0_2px_0_var(--edge)]">
+          {/* Restaurant header */}
+          <div className="text-center pb-5">
+            <input
+              type="text"
+              value={bill.restaurant ?? ""}
+              placeholder="Restaurant name"
+              onChange={(e) => {
+                setBill((b) => ({ ...b, restaurant: e.target.value }));
+                scheduleSave();
+              }}
+              className="field-bare w-full text-center font-display italic text-2xl sm:text-3xl tracking-tight text-fg placeholder:text-fg-faint/70"
+            />
+            <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.24em] text-fg-faint">
+              · Splitr · {bill.currency}
+            </p>
+          </div>
+
+          <hr className="divide-receipt" />
+
+          {/* Items */}
+          <ul className="stagger py-4 space-y-1">
+            {bill.items.length === 0 && (
+              <li className="text-center py-8 text-fg-dim text-sm">
+                No items yet. Add one below.
+              </li>
+            )}
             {bill.items.map((it) => (
               <ItemRow
                 key={it.id}
                 item={it}
                 participants={bill.participants}
                 selectedParticipantId={selectedParticipantId}
+                currency={bill.currency}
                 onPatch={(patch) => patchItem(it.id, patch)}
                 onDelete={() => deleteItem(it.id)}
                 onToggleAssign={(pid) => toggleAssignment(it.id, pid)}
               />
             ))}
           </ul>
+
           <button
             onClick={addItem}
-            className="mt-3 w-full py-3 rounded-xl border border-dashed border-zinc-300 text-zinc-500 hover:bg-white hover:text-zinc-900 transition"
+            className="mt-1 w-full py-3 rounded-xl border border-dashed border-edge-strong text-fg-dim text-sm hover:text-fg hover:border-fg-dim transition"
           >
             + Add item
           </button>
-        </section>
 
-        {/* Tax + tip */}
-        <section className="bg-white rounded-2xl border border-zinc-200 p-4 space-y-3">
-          <MoneyRow
-            label="Subtotal"
-            value={bill.subtotal}
-            currency={bill.currency}
-            readOnly
-          />
-          <MoneyRow
-            label="Tax"
-            value={bill.tax}
-            currency={bill.currency}
-            onChange={(v) => patchTaxOrTip("tax", v)}
-          />
-          <MoneyRow
-            label="Tip"
-            value={bill.tip}
-            currency={bill.currency}
-            onChange={(v) => patchTaxOrTip("tip", v)}
-          />
-          <div className="border-t border-zinc-200 pt-3">
-            <MoneyRow
-              label="Total"
-              value={bill.total}
+          <hr className="divide-receipt my-5" />
+
+          {/* Totals */}
+          <div className="space-y-2.5 num">
+            <Row
+              label="Subtotal"
+              value={
+                <span className="text-fg-dim">
+                  {formatMoney(bill.subtotal, bill.currency)}
+                </span>
+              }
+            />
+            <EditableRow
+              label="Tax"
               currency={bill.currency}
-              readOnly
-              bold
+              value={bill.tax}
+              onChange={(v) => patchTaxOrTip("tax", v)}
+            />
+            <EditableRow
+              label="Tip"
+              currency={bill.currency}
+              value={bill.tip}
+              onChange={(v) => patchTaxOrTip("tip", v)}
             />
           </div>
-        </section>
+
+          <hr className="divide-receipt my-4" />
+
+          <div className="flex items-baseline justify-between">
+            <span className="font-mono text-[11px] uppercase tracking-[0.24em] text-fg-dim">
+              Total
+            </span>
+            <span className="font-display italic text-3xl sm:text-4xl text-fg num">
+              {formatMoney(bill.total, bill.currency)}
+            </span>
+          </div>
+
+          {/* Bottom flourish */}
+          <div className="flex justify-center mt-5">
+            <span className="font-mono text-[10px] tracking-[0.4em] text-fg-faint">
+              ✦ ✦ ✦
+            </span>
+          </div>
+        </article>
 
         {/* Participants */}
-        <section>
-          <SectionHeader title="Who's splitting?" />
+        <section className="mt-8">
+          <div className="flex items-baseline justify-between mb-4">
+            <h2 className="font-mono text-[11px] uppercase tracking-[0.24em] text-fg-dim">
+              Who's splitting?
+            </h2>
+            {bill.participants.length > 0 && (
+              <span className="font-mono text-[10px] uppercase tracking-[0.22em] text-fg-faint">
+                {bill.participants.length} ·{" "}
+                {selectedParticipantId ? "tap items" : "tap a name first"}
+              </span>
+            )}
+          </div>
+
           <ParticipantList
             participants={bill.participants}
             selectedId={selectedParticipantId}
             onSelect={setSelectedParticipantId}
             onAdd={addParticipant}
             onRemove={removeParticipant}
-            split={split}
           />
-          {bill.participants.length > 0 && !allItemsAssigned && (
-            <p className="text-xs text-amber-600 mt-3">
-              {selectedParticipantId
-                ? "Tap items above to assign them to the selected person."
-                : "Tap a person, then tap items to assign."}
+
+          {bill.participants.length > 0 && unassignedCount > 0 && (
+            <p className="mt-4 font-mono text-[10px] uppercase tracking-[0.18em] text-warn">
+              {unassignedCount} unassigned · they won't be split
             </p>
           )}
         </section>
 
-        {/* Continue button */}
-        <div className="pt-4">
+        {/* Primary CTA — sits at the end of the editing flow, not stuck to
+            the viewport, so it never overlaps the participant input. */}
+        <section className="mt-8">
           <Link
             href={`/b/${bill.id}/summary`}
             aria-disabled={noParticipants}
@@ -278,40 +446,52 @@ export default function BillEditor({ initialBill }: Props) {
                 toast.error("Add at least one person first");
               }
             }}
-            className={`block text-center w-full py-4 rounded-2xl text-lg font-medium transition ${
+            className={`flex items-center justify-between gap-3 rounded-3xl px-6 py-4 transition shadow-[0_8px_30px_rgba(198,61,28,0.25)] ${
               noParticipants
-                ? "bg-zinc-200 text-zinc-400 cursor-not-allowed"
-                : "bg-black text-white hover:bg-zinc-800"
+                ? "bg-fg-faint/30 text-fg-faint cursor-not-allowed shadow-none"
+                : "bg-accent text-white hover:brightness-110 active:scale-[0.99]"
             }`}
           >
-            See the split →
+            <div className="text-left">
+              <div className="font-display italic text-lg leading-tight">
+                See the split
+              </div>
+              <div className="text-[11px] opacity-80 font-mono uppercase tracking-[0.18em]">
+                {allItemsAssigned
+                  ? "Everything assigned"
+                  : noParticipants
+                    ? "Add someone first"
+                    : `${unassignedCount} pending`}
+              </div>
+            </div>
+            <ArrowIcon />
           </Link>
-          {!allItemsAssigned && bill.items.length > 0 && (
-            <p className="text-center text-xs text-zinc-500 mt-2">
-              {bill.items.filter((it) => it.assignments.length === 0).length}{" "}
-              item(s) still unassigned — they won't be split.
-            </p>
-          )}
-        </div>
+        </section>
+
+        {/* Danger zone */}
+        <section className="mt-10 pt-6 border-t border-edge">
+          <div className="font-mono text-[10px] uppercase tracking-[0.24em] text-fg-faint mb-3">
+            Danger zone
+          </div>
+          <DeleteBillButton billId={bill.id} label="Delete this bill" />
+          <p className="mt-2 text-[11px] text-fg-faint leading-snug">
+            Removes the bill, all items, and everyone's assignments. Personal
+            share links stop working immediately.
+          </p>
+        </section>
       </div>
+
     </main>
   );
 }
 
 // =================================================================
 
-function SectionHeader({ title }: { title: string }) {
-  return (
-    <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-500 mb-3">
-      {title}
-    </h2>
-  );
-}
-
 function ItemRow({
   item,
   participants,
   selectedParticipantId,
+  currency,
   onPatch,
   onDelete,
   onToggleAssign,
@@ -319,79 +499,121 @@ function ItemRow({
   item: FullBill["items"][number];
   participants: FullBill["participants"];
   selectedParticipantId: string | null;
-  onPatch: (patch: Partial<{ name: string; price: number; quantity: number }>) => void;
+  currency: string;
+  onPatch: (
+    patch: Partial<{ name: string; price: number; quantity: number }>,
+  ) => void;
   onDelete: () => void;
   onToggleAssign: (participantId: string) => void;
 }) {
   const assignedIds = new Set(item.assignments.map((a) => a.participantId));
   const tapToAssign = selectedParticipantId !== null;
+  const isAssignedToSelected =
+    selectedParticipantId !== null && assignedIds.has(selectedParticipantId);
 
   return (
     <li
       onClick={() => {
         if (tapToAssign) onToggleAssign(selectedParticipantId!);
       }}
-      className={`bg-white rounded-2xl border p-3 transition ${
+      className={`-mx-2 px-2 py-2 rounded-xl transition ${
         tapToAssign
-          ? "border-zinc-300 cursor-pointer active:scale-[0.99]"
-          : "border-zinc-200"
-      } ${assignedIds.has(selectedParticipantId!) ? "ring-2 ring-black" : ""}`}
+          ? `cursor-pointer ${isAssignedToSelected ? "bg-accent-soft" : "hover:bg-bg active:bg-bg"}`
+          : ""
+      }`}
     >
       <div className="flex items-center gap-2">
-        <input
-          type="text"
-          value={item.name}
-          onChange={(e) => onPatch({ name: e.target.value })}
-          onClick={(e) => e.stopPropagation()}
-          className="flex-1 min-w-0 bg-transparent outline-none text-base font-medium"
-        />
-        <input
-          type="number"
-          inputMode="decimal"
-          step="0.01"
-          min="0"
-          value={item.quantity > 1 ? item.quantity : ""}
-          placeholder="1"
-          onChange={(e) =>
-            onPatch({ quantity: Math.max(1, parseInt(e.target.value || "1")) })
-          }
-          onClick={(e) => e.stopPropagation()}
-          className="w-12 text-center bg-zinc-100 rounded-lg py-1 outline-none text-sm"
-          title="Quantity"
-        />
-        <span className="text-zinc-400">×</span>
-        <input
-          type="number"
-          inputMode="decimal"
-          step="0.01"
-          min="0"
-          value={item.price}
-          onChange={(e) => onPatch({ price: parseFloat(e.target.value) || 0 })}
-          onClick={(e) => e.stopPropagation()}
-          className="w-20 text-right bg-zinc-100 rounded-lg py-1 px-2 outline-none tabular-nums"
-        />
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          className="ml-1 text-zinc-300 hover:text-red-500 transition w-6 h-6"
-          aria-label="Remove item"
+        {/* Inputs become non-interactive while a participant is selected so the
+            entire row is one big tap target for assigning. */}
+        <div
+          className={`flex-1 min-w-0 flex items-center gap-2 ${
+            tapToAssign ? "pointer-events-none select-none" : ""
+          }`}
         >
-          ✕
-        </button>
+          <input
+            type="text"
+            value={item.name}
+            onChange={(e) => onPatch({ name: e.target.value })}
+            onClick={(e) => e.stopPropagation()}
+            readOnly={tapToAssign}
+            tabIndex={tapToAssign ? -1 : 0}
+            className="field-bare flex-1 min-w-0 text-[15px] text-fg"
+          />
+          <input
+            type="number"
+            inputMode="numeric"
+            step="1"
+            min="1"
+            value={item.quantity > 1 ? item.quantity : ""}
+            placeholder="1"
+            onChange={(e) =>
+              onPatch({
+                quantity: Math.max(1, parseInt(e.target.value || "1")),
+              })
+            }
+            onClick={(e) => e.stopPropagation()}
+            readOnly={tapToAssign}
+            tabIndex={tapToAssign ? -1 : 0}
+            className="field-qty text-fg-dim font-mono text-sm"
+            title="Quantity"
+          />
+          <span className="font-mono text-fg-faint text-sm">×</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            step="0.01"
+            min="0"
+            value={item.price}
+            onChange={(e) =>
+              onPatch({ price: parseFloat(e.target.value) || 0 })
+            }
+            onClick={(e) => e.stopPropagation()}
+            readOnly={tapToAssign}
+            tabIndex={tapToAssign ? -1 : 0}
+            className="field-num text-fg font-mono text-[15px]"
+          />
+        </div>
+        {tapToAssign ? (
+          <span
+            aria-hidden="true"
+            className={`ml-1 w-6 h-6 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors duration-200 ${
+              isAssignedToSelected
+                ? "bg-accent border-accent text-white"
+                : "border-edge-strong text-transparent"
+            }`}
+          >
+            {/* key flips on toggle so the pop-in animation re-runs each tap */}
+            <span
+              key={isAssignedToSelected ? "on" : "off"}
+              className={isAssignedToSelected ? "anim-pop-in" : "inline-flex"}
+            >
+              <CheckIcon />
+            </span>
+          </span>
+        ) : (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            className="ml-1 text-fg-faint hover:text-accent transition w-5 h-5 flex items-center justify-center text-sm"
+            aria-label="Remove item"
+          >
+            ×
+          </button>
+        )}
       </div>
       {item.assignments.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-2">
+        <div className="flex flex-wrap gap-1 mt-1.5 ml-1">
           {item.assignments.map((a) => {
             const p = participants.find((pp) => pp.id === a.participantId);
             if (!p) return null;
             return (
               <span
                 key={a.participantId}
-                className="text-xs bg-zinc-900 text-white rounded-full px-2 py-0.5"
+                className="font-mono text-[10px] uppercase tracking-[0.12em] text-accent"
               >
-                {p.name}
+                · {p.name}
               </span>
             );
           })}
@@ -401,48 +623,41 @@ function ItemRow({
   );
 }
 
-function MoneyRow({
+function Row({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-baseline justify-between">
+      <span className="text-fg-dim text-sm">{label}</span>
+      <span className="font-mono text-sm">{value}</span>
+    </div>
+  );
+}
+
+function EditableRow({
   label,
   value,
   currency,
-  readOnly,
-  bold,
   onChange,
 }: {
   label: string;
   value: number;
   currency: string;
-  readOnly?: boolean;
-  bold?: boolean;
-  onChange?: (v: number) => void;
+  onChange: (v: number) => void;
 }) {
   return (
-    <div
-      className={`flex items-center justify-between ${
-        bold ? "text-lg font-semibold" : "text-base"
-      }`}
-    >
-      <span className={readOnly ? "text-zinc-700" : "text-zinc-700"}>
-        {label}
-      </span>
-      {readOnly ? (
-        <span className="tabular-nums">
-          {currency} {value.toFixed(2)}
-        </span>
-      ) : (
-        <div className="flex items-center gap-2">
-          <span className="text-zinc-400 text-sm">{currency}</span>
-          <input
-            type="number"
-            inputMode="decimal"
-            step="0.01"
-            min="0"
-            value={value}
-            onChange={(e) => onChange?.(parseFloat(e.target.value) || 0)}
-            className="w-24 text-right bg-zinc-100 rounded-lg py-1 px-2 outline-none tabular-nums"
-          />
-        </div>
-      )}
+    <div className="flex items-baseline justify-between">
+      <span className="text-fg-dim text-sm">{label}</span>
+      <div className="flex items-baseline gap-1.5">
+        <span className="font-mono text-xs text-fg-faint">{currency}</span>
+        <input
+          type="number"
+          inputMode="decimal"
+          step="0.01"
+          min="0"
+          value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+          className="field-num font-mono text-sm text-fg-dim w-16"
+        />
+      </div>
     </div>
   );
 }
@@ -453,14 +668,12 @@ function ParticipantList({
   onSelect,
   onAdd,
   onRemove,
-  split,
 }: {
   participants: FullBill["participants"];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   onAdd: (name: string) => void;
   onRemove: (id: string) => void;
-  split: ReturnType<typeof computeSplit>;
 }) {
   const [draftName, setDraftName] = useState("");
 
@@ -468,28 +681,18 @@ function ParticipantList({
     <div>
       <div className="flex flex-wrap gap-2 mb-3">
         {participants.map((p) => {
-          const ps = split.participants.find((sp) => sp.participantId === p.id);
           const isSelected = selectedId === p.id;
           return (
             <button
               key={p.id}
               onClick={() => onSelect(isSelected ? null : p.id)}
-              className={`flex items-center gap-2 rounded-full pl-3 pr-2 py-1.5 transition ${
+              className={`group flex items-center gap-2 rounded-full pl-3 pr-1.5 py-1.5 transition ${
                 isSelected
-                  ? "bg-black text-white"
-                  : "bg-white border border-zinc-200 text-zinc-700 hover:border-zinc-400"
+                  ? "bg-fg text-bg"
+                  : "bg-bg-elev border border-edge text-fg hover:border-edge-strong"
               }`}
             >
-              <span className="font-medium">{p.name}</span>
-              {ps && ps.total > 0 && (
-                <span
-                  className={`text-xs tabular-nums ${
-                    isSelected ? "text-zinc-300" : "text-zinc-500"
-                  }`}
-                >
-                  {ps.total.toFixed(2)}
-                </span>
-              )}
+              <span className="font-medium text-sm">{p.name}</span>
               <span
                 role="button"
                 aria-label="Remove"
@@ -497,18 +700,19 @@ function ParticipantList({
                   e.stopPropagation();
                   onRemove(p.id);
                 }}
-                className={`ml-1 w-5 h-5 inline-flex items-center justify-center rounded-full ${
+                className={`w-5 h-5 inline-flex items-center justify-center rounded-full transition ${
                   isSelected
-                    ? "hover:bg-white/20"
-                    : "text-zinc-300 hover:text-red-500"
+                    ? "hover:bg-bg/20"
+                    : "text-fg-faint hover:text-accent"
                 }`}
               >
-                ✕
+                ×
               </span>
             </button>
           );
         })}
       </div>
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -522,16 +726,53 @@ function ParticipantList({
           value={draftName}
           onChange={(e) => setDraftName(e.target.value)}
           placeholder="Add a person…"
-          className="flex-1 bg-white border border-zinc-200 rounded-xl px-3 py-2 outline-none focus:border-zinc-400"
+          className="flex-1 bg-bg-elev border border-edge rounded-2xl px-4 py-2.5 outline-none focus:border-fg-dim transition text-sm placeholder:text-fg-faint"
         />
         <button
           type="submit"
           disabled={!draftName.trim()}
-          className="px-4 rounded-xl bg-zinc-900 text-white disabled:opacity-40"
+          className="px-5 rounded-2xl bg-fg text-bg text-sm font-medium disabled:opacity-30 disabled:cursor-not-allowed hover:opacity-90 transition"
         >
           Add
         </button>
       </form>
     </div>
+  );
+}
+
+function ArrowIcon() {
+  return (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <line x1="5" y1="12" x2="19" y2="12" />
+      <polyline points="12 5 19 12 12 19" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="3"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
   );
 }

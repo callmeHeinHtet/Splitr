@@ -1,12 +1,60 @@
 export type PayProvider = "venmo" | "paypal" | "cashapp" | "wise" | "other";
 
-export const PAY_PROVIDERS: { id: PayProvider; label: string }[] = [
-  { id: "venmo", label: "Venmo" },
-  { id: "paypal", label: "PayPal" },
-  { id: "cashapp", label: "Cash App" },
-  { id: "wise", label: "Wise" },
-  { id: "other", label: "Other" },
+export type PayProviderInfo = {
+  id: PayProvider;
+  label: string;
+  /** Static text shown in front of the input so the format is unmistakable. */
+  prefix: string;
+  /** Placeholder inside the input. */
+  placeholder: string;
+  /** One-line hint shown under the input. */
+  hint: string;
+};
+
+export const PAY_PROVIDERS: PayProviderInfo[] = [
+  {
+    id: "venmo",
+    label: "Venmo",
+    prefix: "@",
+    placeholder: "your-username",
+    hint: "Your Venmo @username — not your email. In the app: Me tab → tap your name to copy it.",
+  },
+  {
+    id: "paypal",
+    label: "PayPal",
+    prefix: "paypal.me/",
+    placeholder: "your-handle",
+    hint: "Your PayPal.Me handle (not your email). If you haven't claimed one yet, do it free at paypal.me.",
+  },
+  {
+    id: "cashapp",
+    label: "Cash App",
+    prefix: "$",
+    placeholder: "yourcashtag",
+    hint: "Your $cashtag — in the Cash App: profile icon → your name. Letters and numbers, no spaces.",
+  },
+  {
+    id: "wise",
+    label: "Wise",
+    prefix: "",
+    placeholder: "wise.com/pay/me/yourname",
+    hint: "Wise has no auto-pay link, so paste your full wise.com profile URL — friends will open it manually.",
+  },
+  {
+    id: "other",
+    label: "Other",
+    prefix: "",
+    placeholder: "How they should pay you",
+    hint: "Free-form text shown to friends. They'll need to pay you manually — no in-app link.",
+  },
 ];
+
+export function getProviderInfo(p: PayProvider | null | undefined): PayProviderInfo {
+  return (
+    PAY_PROVIDERS.find((x) => x.id === p) ??
+    PAY_PROVIDERS[PAY_PROVIDERS.length - 1]
+  );
+}
 
 export function buildPayLink(opts: {
   provider: PayProvider | null | undefined;
